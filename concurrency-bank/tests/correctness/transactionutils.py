@@ -12,7 +12,7 @@ from collections import deque
 from random import randint
 from subprocess import PIPE, Popen, TimeoutExpired
 from sys import stdout
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional, Sequence
 import re
 
 from tempfile import NamedTemporaryFile
@@ -20,16 +20,22 @@ from tempfile import NamedTemporaryFile
 logging.getLogger().setLevel(logging.INFO)
 
 
-regex = re.compile(r"test (\d{1,2}):.*(passed|failed).*$", re.MULTILINE)
+regex = re.compile(r"test (\d{1,2}):.*(?:passed|failed).*$", re.MULTILINE)
 
+opening_balance_patern = re.compile(
+    r"^(?:Opening|Closing) balance: (?P<opening_balance>\d+)$", re.MULTILINE)
+closing_balance_patern = re.compile(
+    r"^Closing balance: (?P<closing_balance>\d+)$", re.MULTILINE)
 
 transaction_data_pattern = re.compile(
-    r"^(?P<type>deposit|withdraw)+ (?P<amount>-{0,1}\d+)$"
+    r"^(?P<type>deposit|withdraw)+ (?P<amount>-?\d+)$"
 )
 transaction_record_pattern = re.compile(
-    r"^(?P<type>Deposit|Withdraw): (?P<amount>-{0,1}\d+), "
+    r"^(?P<type>Deposit|Withdraw): (?P<amount>-?\d+), "
     r"User: (?P<user>Husband|Wife), "
-    r"(?:Account balance after: (?P<balance>-{0,1}\d+)|(?P<status>Transaction (?:declined|failed)))$"
+    r"(?:Account balance after: (?P<balance>-?\d+)"
+    r"|(?:Transaction (?P<status>declined|failed)))$",
+    re.MULTILINE
 )
 
 
@@ -120,14 +126,15 @@ class TransactionTester:
         if not source.is_file():
             raise ValueError("Source file cannot be a directory!")
 
-        match binary_location:
-            case None:
-                binary_location = source.parent
-            case loc:
-                if not loc.exists():
-                    raise ValueError("Binary output location does not exist")
-                if not loc.is_dir():
-                    raise ValueError("Binary output location cannot be a file!")
+
+        if binary_location is None:
+            binary_location = source.parent
+
+        if not binary_location.exists():
+            raise ValueError("Binary output location does not exist")
+        if not binary_location.is_dir():
+            raise ValueError(
+                "Binary output location cannot be a file!")
 
         with Popen(
             [
@@ -169,7 +176,9 @@ class TransactionTester:
                 raise ValueError("Code failed to compile") from exc
 
     def run_and_test_output(
-        self, start_balance: int, husband: Path, wife: Path
+        self, start_balance: int, husband: Path, wife: Path,
+        custom_check: Callable[[list[TransactionRecord]],
+                               bool] = lambda _: True
     ) -> bool:
         husband_queue = deque(filter(None, TransactionData.from_file(husband)))
         wife_queue = deque(filter(None, TransactionData.from_file(wife)))
@@ -183,86 +192,98 @@ class TransactionTester:
         ) as test_runner:  #
             logging.debug(f"Beginning test...")
             try:
-                out, _ = test_runner.communicate(timeout=20)
+
+                out, _ = test_runner.communicate(timeout=200)
                 out_lines = out.splitlines()
-                match len(out_lines):
-                    case 0 | 1:
-                        logging.error(
-                            f"Invalid number of output lines: {len(out_lines)}"
-                        )
+
+                if (num_lines := len(out_lines)) <= 1:
+                    logging.error(
+                        f"Invalid number of output lines: {num_lines}"
+                    )
+                    return False
+                else:
+                    if not self.verify_transactions(
+                        start_balance, husband_queue, wife_queue, out_lines,
+                        custom_check
+                    ):
                         return False
-                    case 2:
-                        return len(husband_queue) + len(
-                            wife_queue
-                        ) == 0 and out_lines == [
-                            f"Opening balance: {start_balance}",
-                            f"Closing balance: {start_balance}",
-                        ]
-                    case _:
-
-                        out_queue = deque(
-                            TransactionRecord.from_iter(out_lines[1:-1])
-                        )
-
-                        return self.verify_transactions(
-                            start_balance, husband_queue, wife_queue, out_queue
-                        )
 
             except TimeoutExpired:
                 logging.critical("Timed out on test")
+                return False
 
-        logging.info(
-            f"test: {self.binary} {start_balance} {husband} {wife} completed"
+        logging.debug(
+            f"test: {self.binary} {start_balance} {husband} {wife} completed sucessfully"
         )
 
-        return False
+        return True
 
     def verify_transactions(
         self,
         start_balance: int,
         husband_queue: deque[TransactionData],
         wife_queue: deque[TransactionData],
-        out_queue: deque[TransactionRecord],
+        out_lines: Sequence[str],
+        custom_check: Callable[[list[TransactionRecord]],
+                               bool] = lambda _: True
+
     ) -> bool:
 
         balance: int = start_balance
 
+        if opening_match := re.match(opening_balance_patern, out_lines[0]):
+
+            if opening_balance := int(opening_match.group('opening_balance')) != balance:
+                logging.info(
+                    f"Start balance mismatch: found {start_balance}, expected {balance}")
+                return False
+
+        out_queue = deque(
+            TransactionRecord.from_iter(out_lines[1:-1])
+        )
+
         for transaction_record in out_queue:
-            match transaction_record:
-                case trans_r if trans_r.user == "Husband":
-                    try:
-                        husband_trans = husband_queue.popleft()
-                    except IndexError:
-                        return False
 
-                    if not self.verify_transaction(
-                        balance, trans_r, husband_trans
-                    ):
-                        return False
-                    else:
-                        balance = (
-                            trans_r.balance_after
-                            if trans_r.balance_after is not None
-                            else balance
-                        )
-
-                case trans_r if trans_r.user == "Wife":
-                    try:
-                        wife_trans = wife_queue.popleft()
-                    except IndexError:
-                        return False
-                    if not self.verify_transaction(
-                        balance, trans_r, wife_trans
-                    ):
-                        return False
-                    else:
-                        balance = (
-                            trans_r.balance_after
-                            if trans_r.balance_after is not None
-                            else balance
-                        )
-                case _:  # Somehow, an unknown user may show up
+            if transaction_record.user == "Husband":
+                try:
+                    current_trans = husband_queue.popleft()
+                except IndexError:
                     return False
+
+            elif transaction_record.user == "Wife":
+                try:
+                    current_trans = wife_queue.popleft()
+                except IndexError:
+                    return False
+
+            else:  # Somehow, an unknown user may show up
+                return False
+
+            if not self.verify_transaction(
+                balance, transaction_record, current_trans
+            ):
+                return False
+            else:
+                balance = (
+                    transaction_record.balance_after
+                    if transaction_record.balance_after is not None
+                    else balance
+                )
+
+        if (remaining := (len(husband_queue) + len(wife_queue))) != 0:
+            logging.error(f"{remaining} transactions unprocessed")
+            return False
+
+        if not custom_check(list(out_queue)):
+            logging.error("Concurency test failed")
+            return False
+
+        if closing_match := re.match(closing_balance_patern, out_lines[-1]):
+
+            if closing_balance := int(closing_match.group('closing_balance')) != balance:
+                logging.info(
+                    f"closing balance mismatch: found {closing_balance}, expected {balance}")
+                return False
 
         return True
 
@@ -275,8 +296,11 @@ class TransactionTester:
 
         if transaction_record.amount != transaction.amount:
             logging.error("Transaction amount mismatch")
+            logging.info(f"Current balance: {balance}")
             logging.info(f"Amount in record: {transaction_record.amount}")
             logging.info(f"Amount in transaction: {transaction.amount}")
+            logging.info(f"Transaction: {transaction}")
+            logging.info(f"Record: {transaction_record}")
             return False
 
         if (
@@ -285,131 +309,89 @@ class TransactionTester:
         ):
             logging.error(
                 f"Transaction amount negative ({transaction_record.amount}) yet not declined"
+                f"\nRecord: {transaction_record}"
             )
             return False
 
-        match (transaction, transaction_record):
-            # Test 1: Amount match
-            case (x, y) if x.amount != y.amount:
-                logging.error("Test 1 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
-            # Test 2: Negative amounts were rejected
-            case (x, y) if x.amount < 0 and y.balance_after is not None:
-                logging.error("Test 2 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
-            # Test 3: No underflow allowed
-            case (
-                TransactionData(TransactionType.WITHDRAWAL, _) as x,
-                y,
-            ) if x.amount > balance and y.balance_after is not None:
-                logging.error("Test 3 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
-            # Test 4: Negative transactions not allowed
-            case (x, y) if x.amount < 0 and y.balance_after is not None:
-                logging.error("Test 4 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
-            # Test 5: Check for correct balance after withdrawal
-            case (
-                TransactionData(TransactionType.WITHDRAWAL, _) as x,
-                y,
-            ) if 0 <= x.amount < balance and y.balance_after != balance - x.amount:
-                logging.error("Test 5 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
+        # Todo: refactor if-else ladder
+        td, tr = transaction, transaction_record
 
+        if td.amount != tr.amount:
+            logging.error("Test 1 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            return False
+
+        elif td.amount < 0 and tr.balance_after is not None:
+            # Test 2: Negative amounts were rejected
+            logging.error("Test 2 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            return False
+
+        elif td.type == TransactionType.WITHDRAWAL and td.amount > balance and tr.balance_after is not None:
+            # Test 3: No withdrawal underflow allowed
+            logging.error("Test 3 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            return False
+
+        elif td.amount < 0 and tr.balance_after is not None:
+            # Test 4: Negative transactions not allowed
+            logging.error("Test 4 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            return False
+
+        elif td.type == TransactionType.WITHDRAWAL \
+                and (0 <= td.amount < balance and tr.balance_after != balance - td.amount):
+            # Test 5: Check for correct balance after withdrawal
+
+            # Special case for withdrawal: 0 amount can either succeed or be rejected
+            if td.amount == 0 and tr.balance_after in {None, balance}:
+                return True
+
+            logging.error("Test 5 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            logging.info(
+                f"Expected {balance - td.amount} after withdrawal: found {tr.balance_after}")
+            return False
+
+        elif td.type == TransactionType.DEPOSIT \
+            and ( td.amount >= 0 and tr.balance_after != balance + td.amount):
+            
+            # Special case for deposit: 0 amount can either succeed or be rejected
+            if td.amount == 0 and tr.balance_after in {None, balance}:
+                return True
+            
             # Test 6: Check for correct balance after deposit
-            case (
-                TransactionData(TransactionType.DEPOSIT, a) as x,
-                y,
-            ) if a > 0 and y.balance_after != balance + x.amount:
-                logging.error("Test 6 failed!")
-                logging.info(f"current balance: {balance}")
-                logging.info(f"Transaction under test: {transaction}")
-                logging.info(
-                    f"Transaction record being verified: {transaction_record}"
-                )
-                return False
+            logging.error("Test 6 failed!")
+            logging.info(f"current balance: {balance}")
+            logging.info(f"Transaction under test: {transaction}")
+            logging.info(
+                f"Transaction record being verified: {transaction_record}"
+            )
+            logging.info(
+                f"Expected {balance + td.amount} after deposit: found {tr.balance_after}")
+            return False
 
         return True
-
-    def run_tests(self):
-        if not self.binary.exists():
-            logging.critical("binary does not exist passed")
-            return
-
-        self.run_basic_tests()
-
-    # Todo: cleanup and stuff
-    # Critical: Violation of single responsibility
-    def run_basic_tests(self):
-        for t_num in range(1, 11):  # TODO: Remove magic numbers
-            with Popen(
-                f"""./test-bank.sh -t {t_num}""",
-                text=True,
-                shell=True,
-                stdout=PIPE,
-                cwd=self.binary.parent,
-                stderr=PIPE,
-            ) as test_runner:  #
-                logging.debug(f"Executed basic test #{t_num}")
-                try:
-                    out, _ = test_runner.communicate(timeout=20)
-                    out_lines = out.splitlines()
-                    # print( out, file=stdout )
-                    # print( _, file=stdout )
-
-                    if match := regex.match(out):
-                        num, status = match.group(1, 2)
-
-                        if status == "passed":
-                            logging.info(f"Passed basic test {num}/10")
-                            logging.debug(
-                                f"Pass message: {'None' if len(out_lines) == 0 else out_lines[0]}"
-                            )
-                            # solo_test[ 'Passed' ] += 1
-                            # solo_test[ 'Remarks' ].append( f"Passed test {num}" )
-                        else:
-                            logging.error(f"Failed basic test {num}/10")
-                            logging.debug(
-                                f"Failure message: {'None' if len(out_lines) == 0 else out_lines[0]}"
-                            )
-                            # solo_test[ 'Failed' ] += 1
-                            # solo_test[ 'Remarks' ].append( f"Failed test {num}" )
-                    else:
-                        # other possible failure
-                        logging.error(f"Failed basic test {t_num}/10")
-                        # unnecessary allocation in splitlines, I know
-                        logging.debug(
-                            f"Failure message: {'None' if len(out_lines) == 0 else out_lines[0]}"
-                        )
-
-                except TimeoutExpired:
-                    logging.critical(f"Timed out on test {t_num}/10")
-                    pass
 
     def test_random_input(
         self,
@@ -449,17 +431,17 @@ class TransactionTester:
         ) as file:
             for _ in range(n_lines):
 
-                match randint(0, 100):
-                    case x if x < empty_thresh:
-                        file.write("\n")
-                    case x if x > withdraw_thresh:
-                        file.write(
-                            f"withdraw {randint(amount_range.start, amount_range.stop)}\n"
-                        )
-                    case _:
-                        file.write(
-                            f"deposit {randint(amount_range.start, amount_range.stop)}\n"
-                        )
+                probability = randint(0,100)
+                if probability < empty_thresh:
+                    file.write("\n")
+                elif probability > withdraw_thresh:
+                    file.write(
+                        f"withdraw {randint(amount_range.start, amount_range.stop)}\n"
+                    )
+                else:
+                    file.write(
+                        f"deposit {randint(amount_range.start, amount_range.stop)}\n"
+                    )
 
             return Path(file.name)
 

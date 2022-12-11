@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 
 # **Mini-Project 2:**
 
@@ -202,7 +201,7 @@ following commands (in your projects folder).
 - Passes provided tests (25%)
 - Passes correctness tests (55%)
 - Reasonable coding attempt (20%)
-=======
+=========
 
 # **Mini-Project 2:**
 
@@ -406,4 +405,4 @@ following commands (in your projects folder).
 - Passes provided tests (25%)
 - Passes correctness tests (55%)
 - Reasonable coding attempt (20%)
->>>>>>> origin/bank-project
+>>>>>>>>> Temporary merge branch 2

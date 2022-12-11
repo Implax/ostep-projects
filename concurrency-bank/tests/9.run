@@ -1,1 +1,1 @@
-./bank 500 tests/assets/no_transactions_wel.txt tests/assets/no_transactions_wel.txt
+./bank 500 Husband.txt Wife.txt
